@@ -36,6 +36,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <librealsense2/rsutil.h>
 #include <librealsense2/hpp/rs_processing.hpp>
 #include <librealsense2/rs_advanced_mode.hpp>
+#include <cstdlib>
 #include <fstream>
 #endif
 
@@ -79,7 +80,9 @@ CameraRealSense2::CameraRealSense2(
 	globalTimeSync_(true),
 	dualMode_(false),
 	closing_(false),
-	playback_(false)
+	playback_(false),
+	sequentialPlayback_(false),
+	playbackPaused_(false)
 #endif
 {
 	UDEBUG("");
@@ -96,6 +99,15 @@ CameraRealSense2::~CameraRealSense2()
 void CameraRealSense2::close()
 {
 	closing_ = true;
+	if(playbackPaused_)
+	{
+		try
+		{
+			playbackDev_->resume();
+		}
+		catch(...) {}
+		playbackPaused_ = false;
+	}
 	try
 	{
 		UDEBUG("Closing device(s)...");
@@ -781,7 +793,7 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 					auto intrinsic = video_profile.get_intrinsics();
 
 					// rgb or ir left
-					if((!ir_ && video_profile.format() == RS2_FORMAT_RGB8 && video_profile.stream_type() == RS2_STREAM_COLOR) ||
+					if((!ir_ && (video_profile.format() == RS2_FORMAT_RGB8 || video_profile.format() == RS2_FORMAT_BGR8) && video_profile.stream_type() == RS2_STREAM_COLOR) ||
 					   (ir_ && video_profile.format() == RS2_FORMAT_Y8 && (video_profile.stream_index() == 1 || isL500)))
 					{
 						if(!profilesPerSensor[i].empty())
@@ -802,7 +814,7 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 								intrinsic.model,
 								intrinsic.coeffs[0], intrinsic.coeffs[1], intrinsic.coeffs[2], intrinsic.coeffs[3], intrinsic.coeffs[4]);
 						added = true;
-						if(video_profile.format() == RS2_FORMAT_RGB8 || profilesPerSensor[i].size()==2)
+						if(video_profile.format() == RS2_FORMAT_RGB8 || video_profile.format() == RS2_FORMAT_BGR8 || profilesPerSensor[i].size()==2)
 						{
 							break;
 						}
@@ -1159,6 +1171,26 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 		 }
 	 }
 
+	 if(playback_)
+	 {
+		 const char * envSequential = std::getenv("RTABMAP_RS2_SEQUENTIAL_PLAYBACK");
+		 if(envSequential != nullptr && std::string(envSequential) == "1")
+		 {
+			 try
+			 {
+				 playbackDev_.reset(new rs2::playback(dev_[0].as<rs2::playback>()));
+				 sequentialPlayback_ = true;
+				 UWARN("RTABMAP_RS2_SEQUENTIAL_PLAYBACK=1: bag playback will be paused between captures "
+					   "(sequential frame-by-frame processing).");
+			 }
+			 catch(const rs2::error & error)
+			 {
+				 UWARN("Cannot enable sequential playback mode: %s", error.what());
+				 sequentialPlayback_ = false;
+			 }
+		 }
+	 }
+
 	 uSleep(1000); // ignore the first frames
 	 UINFO("Enabling streams...done!");
 
@@ -1311,6 +1343,20 @@ SensorData CameraRealSense2::captureImage(SensorCaptureInfo * info)
 #ifdef RTABMAP_REALSENSE2
 
 	try{
+		if(sequentialPlayback_ && playbackPaused_)
+		{
+			try
+			{
+				playbackDev_->resume();
+				playbackPaused_ = false;
+			}
+			catch(const rs2::error & error)
+			{
+				UWARN("Sequential playback resume failed (end of bag?): %s", error.what());
+				sequentialPlayback_ = false;
+				playbackPaused_ = false;
+			}
+		}
 		auto frameset = syncer_.wait_for_frames(5000);
 		UTimer timer;
 		int desiredFramesetSize = 2;
@@ -1321,6 +1367,20 @@ SensorData CameraRealSense2::captureImage(SensorCaptureInfo * info)
 		}
 		if ((int)frameset.size() == desiredFramesetSize)
 		{
+			if(sequentialPlayback_ && !playbackPaused_)
+			{
+				try
+				{
+					playbackDev_->pause();
+					playbackPaused_ = true;
+				}
+				catch(const rs2::error & error)
+				{
+					UWARN("Sequential playback pause failed: %s", error.what());
+					sequentialPlayback_ = false;
+					playbackPaused_ = false;
+				}
+			}
 			double now = UTimer::now();
 			bool is_rgb_arrived = false;
 			bool is_depth_arrived = false;
@@ -1439,7 +1499,14 @@ SensorData CameraRealSense2::captureImage(SensorCaptureInfo * info)
 				cv::Mat bgr;
 				if(rgb.channels() == 3)
 				{
-					cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+					if(rgb_frame.get_profile().format() == RS2_FORMAT_BGR8)
+					{
+						bgr = rgb.clone();
+					}
+					else
+					{
+						cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+					}
 				}
 				else
 				{

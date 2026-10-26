@@ -113,6 +113,9 @@ private:
 	std::vector<rs2::device> dev_;
 	std::string deviceId_;
 	rs2::syncer syncer_;
+	std::shared_ptr<rs2::playback> playbackDev_;
+	bool sequentialPlayback_;
+	bool playbackPaused_;
 	float depth_scale_meters_;
 	cv::Mat depthBuffer_;
 	cv::Mat rgbBuffer_;
